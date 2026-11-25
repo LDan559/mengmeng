@@ -1,0 +1,131 @@
+name: 蓝奏云小说高速搬运至夸克网盘
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_books:
+        description: "本次同步小说本数上限 (默认 2000 本)"
+        required: false
+        default: "2000"
+      concurrency:
+        description: "并发下载线程数 (建议 8-16 线程)"
+        required: false
+        default: "8"
+      delay:
+        description: "线程错峰微延时 (秒，默认 0.05)"
+        required: false
+        default: "0.05"
+      max_seconds:
+        description: "最大运行时长 (秒，默认 18000 秒即 5 小时)"
+        required: false
+        default: "18000"
+      retry_failed:
+        description: "是否为专向补漏模式 (重新打捞历史失败书籍)"
+        type: boolean
+        default: false
+      custom_cookie:
+        description: "临时覆盖夸克 Cookie (留空则默认读取 Secrets.QUARK_COOKIE)"
+        required: false
+        default: ""
+      custom_alist_url:
+        description: "临时覆盖 Alist 地址 (留空则默认读取 Secrets.ALIST_URL)"
+        required: false
+        default: ""
+      custom_alist_pwd:
+        description: "临时覆盖 Alist 密码 (留空则默认读取 Secrets.ALIST_PWD)"
+        required: false
+        default: ""
+
+jobs:
+  sync:
+    name: 蓝奏云全速同步至夸克网盘
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 配置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安装基础依赖
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests
+          fi
+          mkdir -p data
+
+      - name: 执行云端高速同步搬运
+        env:
+          INPUT_COOKIE: ${{ inputs.custom_cookie }}
+          SECRET_COOKIE: ${{ secrets.QUARK_COOKIE }}
+          INPUT_ALIST_URL: ${{ inputs.custom_alist_url }}
+          SECRET_ALIST_URL: ${{ secrets.ALIST_URL }}
+          INPUT_ALIST_PWD: ${{ inputs.custom_alist_pwd }}
+          SECRET_ALIST_PWD: ${{ secrets.ALIST_PWD }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+          MAX_SECONDS: ${{ inputs.max_seconds }}
+          RETRY_FAILED: ${{ inputs.retry_failed }}
+          GITHUB_ACTIONS: "true"
+        run: |
+          # 优先读取界面临时输入，默认读取仓库加密 Secrets
+          export QUARK_COOKIE="${INPUT_COOKIE:-$SECRET_COOKIE}"
+          export ALIST_URL="${INPUT_ALIST_URL:-$SECRET_ALIST_URL}"
+          export ALIST_PWD="${INPUT_ALIST_PWD:-$SECRET_ALIST_PWD}"
+
+          # 安全性校验：若未配置密钥则提示配置指引并阻断，绝不泄露明文
+          if [ -z "$QUARK_COOKIE" ]; then
+            echo "=========================================================="
+            echo "错误: 未检测到夸克网盘 Cookie！"
+            echo "请在仓库 Settings -> Secrets and variables -> Actions 中添加 QUARK_COOKIE"
+            echo "=========================================================="
+            exit 1
+          fi
+
+          if [ -z "$ALIST_URL" ] || [ -z "$ALIST_PWD" ]; then
+            echo "=========================================================="
+            echo "错误: 未检测到 Alist 连接凭据！"
+            echo "请在仓库 Settings -> Secrets and variables -> Actions 中添加:"
+            echo "  - ALIST_URL (Alist 服务地址，如 http://xxx:5244)"
+            echo "  - ALIST_PWD (Alist 访问密码)"
+            echo "=========================================================="
+            exit 1
+          fi
+
+          EXTRA_ARGS=""
+          if [ "${{ inputs.retry_failed }}" = "true" ]; then
+            EXTRA_ARGS="--retry-failed"
+            echo "【运行模式】启动历史失败书籍专向补漏打捞模式"
+          else
+            echo "【运行模式】标准断点全速同步模式"
+          fi
+
+          python standalone_sync.py \
+            --max-books "${{ inputs.max_books }}" \
+            --delay "${{ inputs.delay }}" \
+            --concurrency "${{ inputs.concurrency }}" \
+            --max-seconds "${{ inputs.max_seconds }}" \
+            $EXTRA_ARGS
+
+      - name: 自动持久化断点状态与同步索引回仓库
+        if: always()
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add data/
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: 自动同步断点状态与索引数据 [skip ci]"
+            git push
+          else
+            echo "数据台账无变动，跳过提交。"
+          fi
