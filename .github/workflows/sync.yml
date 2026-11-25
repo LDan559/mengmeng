@@ -42,6 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
 
     steps:
       - name: 检出仓库代码
@@ -66,6 +67,7 @@ jobs:
           mkdir -p data
 
       - name: 执行云端高速同步搬运
+        id: run_sync
         env:
           INPUT_COOKIE: ${{ inputs.custom_cookie }}
           SECRET_COOKIE: ${{ secrets.QUARK_COOKIE }}
@@ -129,3 +131,14 @@ jobs:
           else
             echo "数据台账无变动，跳过提交。"
           fi
+
+      - name: 自动接力拉起下一批任务 (永动机接续)
+        if: steps.run_sync.outputs.need_relay == 'true' && inputs.retry_failed != true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=========================================================="
+          echo "本批次顺利收工并已保存断点，检测到蓝奏云仍有未搬运书籍！"
+          echo "正在自动拉起下一轮任务继续全速搬运..."
+          echo "=========================================================="
+          gh workflow run sync.yml -f max_books="${{ inputs.max_books }}" -f concurrency="${{ inputs.concurrency }}" -f delay="${{ inputs.delay }}" -f max_seconds="${{ inputs.max_seconds }}"
