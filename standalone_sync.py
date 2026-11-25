@@ -945,6 +945,7 @@ def execute_sync(
 
     # 生产者：遍历 Alist 投递任务
     logger.info("开始扫描 Alist 文件列表并投递搬运队列...")
+    is_all_files_exhausted = False
     try:
         for item in master_alist.list_files(alist_path):
             if stop_event.is_set():
@@ -971,6 +972,9 @@ def execute_sync(
                     break
                 except queue.Full:
                     continue
+        else:
+            if not stop_event.is_set():
+                is_all_files_exhausted = True
 
     except Exception as e:
         logger.error(f"扫描 Alist 列表异常: {e}")
@@ -1011,8 +1015,26 @@ def execute_sync(
     logger.info(f"实时索引已安全写入: {INDEX_FILE}")
     logger.info(f"==================================================")
 
+    need_relay = False
+    if is_all_files_exhausted and not stop_event.is_set():
+        final_status = "ALL_FINISHED"
+        logger.info("恭喜！蓝奏云中全部小说文件已全部搬运并补漏完毕！系统已彻底全部收工。")
+    else:
+        final_status = "NEED_RELAY"
+        need_relay = True
+        logger.info("本批次任务平稳收工，后续仍有未搬运书籍，准备自动接力拉起下一批任务...")
+
+    if os.environ.get("GITHUB_OUTPUT"):
+        try:
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as go:
+                go.write(f"final_status={final_status}\n")
+                go.write(f"need_relay={'true' if need_relay else 'false'}\n")
+        except Exception as e:
+            logger.warning(f"写入 GITHUB_OUTPUT 失败: {e}")
+
     res = {
-        "status": "BATCH_DONE" if success_cnt >= max_books else "COMPLETED",
+        "status": final_status,
+        "need_relay": need_relay,
         "nickname": nick,
         "concurrency": concurrency,
         "success_count": success_cnt,
