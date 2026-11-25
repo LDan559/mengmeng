@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       max_books:
-        description: "本次同步小说本数上限 (默认 2000 本)"
+        description: "本次同步小说本数上限 (默认 20000 本)"
         required: false
-        default: "2000"
+        default: "20000"
       concurrency:
         description: "并发下载线程数 (建议 8-16 线程)"
         required: false
-        default: "8"
+        default: "10"
       delay:
         description: "线程错峰微延时 (秒，默认 0.05)"
         required: false
