@@ -479,27 +479,40 @@ class AlistClient:
                     time.sleep(1.5 * attempt)
         raise RuntimeError(f"下载文件重试 3 次均失败 ({full_path}): {last_err}")
 
-    def list_files(self, root_path: str):
+    def list_files(self, root_path: str, completed_dirs: set = None):
         dirs_queue = collections.deque([(root_path, 0)])
         token = self.get_token()
+        completed_set = set(completed_dirs or [])
 
         while dirs_queue:
             curr_dir, depth = dirs_queue.popleft()
             if depth > 30:
                 continue
 
+            if completed_set and curr_dir in completed_set:
+                logger.info(f"【0秒极速跳过】已全量归档的历史大目录: {curr_dir}")
+                continue
+
             page = 1
-            per_page = 60
+            per_page = 200
             while True:
                 h = {"Authorization": token} if token else {}
                 payload = {"path": curr_dir, "page": page, "per_page": per_page, "refresh": False}
-                try:
-                    resp = self.session.post(f"{self.url}/api/fs/list", headers=h, json=payload, timeout=30)
-                    data = resp.json()
-                except Exception:
-                    break
+                data = None
+                for fetch_attempt in range(1, 4):
+                    try:
+                        resp = self.session.post(f"{self.url}/api/fs/list", headers=h, json=payload, timeout=35)
+                        data = resp.json()
+                        if data.get("code") == 200:
+                            break
+                        if data.get("code") in [401, 403]:
+                            token = self.get_token(force=True)
+                            h = {"Authorization": token} if token else {}
+                    except Exception:
+                        pass
+                    time.sleep(1.0)
 
-                if data.get("code") != 200:
+                if not data or data.get("code") != 200:
                     break
 
                 content = data.get("data", {})
@@ -524,7 +537,7 @@ class AlistClient:
                 if page * per_page >= total or len(items) < per_page:
                     break
                 page += 1
-                time.sleep(0.05)
+                time.sleep(0.02)
 
 
 class QuarkBucketManager:
@@ -595,6 +608,7 @@ class SyncCheckpointManager:
             "nickname": "",
             "last_success_title": "",
             "last_success_path": "",
+            "completed_dirs": [],
             "total_synced_books": 0,
             "bucket_state": {
                 "parent_dir": "/蓝奏云收录",
@@ -630,6 +644,19 @@ class SyncCheckpointManager:
         self.data["total_synced_books"] = self.data.get("total_synced_books", 0) + increment
         self.data["bucket_state"] = bucket_mgr.export_state()
         self.save()
+
+    def mark_dirs_completed(self, dir_paths: list):
+        if "completed_dirs" not in self.data or not isinstance(self.data["completed_dirs"], list):
+            self.data["completed_dirs"] = []
+        cur_set = set(self.data["completed_dirs"])
+        changed = False
+        for p in dir_paths:
+            if p and p not in cur_set:
+                self.data["completed_dirs"].append(p)
+                cur_set.add(p)
+                changed = True
+        if changed:
+            self.save()
 
 
 class IndexRecorder:
@@ -944,10 +971,18 @@ def execute_sync(
         workers.append(t)
 
     # 生产者：遍历 Alist 投递任务
+    completed_dirs = chk_mgr.data.get("completed_dirs", [])
+    if completed_dirs:
+        logger.info(f"检测到历史已全量完成目录 {len(completed_dirs)} 个，本次接力将 0 秒极速跳过无需扫描！")
+
     logger.info("开始扫描 Alist 文件列表并投递搬运队列...")
     is_all_files_exhausted = False
+    skip_count = 0
+    passed_dirs_before_cp = set()
+    last_item_dir = ""
+
     try:
-        for item in master_alist.list_files(alist_path):
+        for item in master_alist.list_files(alist_path, completed_dirs=completed_dirs):
             if stop_event.is_set():
                 break
             if time.time() - start_time >= max_seconds:
@@ -958,12 +993,28 @@ def execute_sync(
             f_name = item["name"]
             f_path = item["full_path"]
             title = clean_book_title(f_name)
+            cur_dir = os.path.dirname(f_path)
 
             if not passed_checkpoint:
+                skip_count += 1
+                if last_item_dir and last_item_dir != cur_dir:
+                    passed_dirs_before_cp.add(last_item_dir)
+                last_item_dir = cur_dir
+
+                if skip_count % 1000 == 0:
+                    logger.info(f"正在全速快进比对历史断点... (已快速跳过 {skip_count} 本 | 当前目录: {cur_dir})")
                 if f_path == last_path:
                     passed_checkpoint = True
-                    logger.info(f"精准匹配到历史断点: 《{title}》，开始全速并发搬运新书...")
+                    logger.info(f"精准匹配到历史断点: 《{title}》 (共快速跳过 {skip_count} 本历史已同步书籍)，开始全速并发搬运新书...")
+                    if passed_dirs_before_cp:
+                        chk_mgr.mark_dirs_completed(list(passed_dirs_before_cp))
+                        logger.info(f"已将断点前的 {len(passed_dirs_before_cp)} 个历史目录标记为已完成，下一轮将 0 秒直达！")
                 continue
+
+            # 断点后跨目录时，自动将已搬运完毕的前一个目录标记为已完成
+            if last_item_dir and last_item_dir != cur_dir:
+                chk_mgr.mark_dirs_completed([last_item_dir])
+            last_item_dir = cur_dir
 
             # 阻塞放入任务队列
             while not stop_event.is_set():
