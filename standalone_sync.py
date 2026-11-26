@@ -892,6 +892,7 @@ def execute_sync(
     fail_cnt = 0
     consecutive_fails = 0
     start_time = time.time()
+    last_path = chk_mgr.data.get("last_success_path", "")
     last_saved_path = [last_path]
 
     def worker_loop(worker_id: int):
@@ -1384,3 +1385,5 @@ def main():
         )
 
 
+if __name__ == "__main__":
+    main()
