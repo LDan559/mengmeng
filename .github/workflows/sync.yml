@@ -127,6 +127,8 @@ jobs:
           git add data/
           if ! git diff --cached --quiet; then
             git commit -m "chore: 自动同步断点状态与索引数据 [skip ci]"
+            # 自动拉取远端可能存在的用户代码更新，防止推送冲突导致断点丢失
+            git pull --rebase origin main || true
             git push
           else
             echo "数据台账无变动，跳过提交。"
@@ -148,5 +150,3 @@ jobs:
             echo "接力提示: 若因 GitHub 防死循环机制导致默认 GITHUB_TOKEN 无法触发新工作流，"
             echo "请在仓库 Settings -> Secrets 中添加 SYNC_PAT 个人访问令牌 (勾选 workflow 权限)，"
             echo "配置后后续批次即可全自动永动机持续接力拉起。"
-            echo "=========================================================="
-          fi
