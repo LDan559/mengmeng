@@ -677,6 +677,26 @@ class IndexRecorder:
             with open(self.index_path, "a", encoding="utf-8") as f:
                 f.write(line)
 
+    def load_synced_titles(self) -> set:
+        """从历史索引台账加载已成功同步的书籍集合 (用于毫秒级全量内存去重)"""
+        titles = set()
+        if os.path.exists(self.index_path):
+            try:
+                with open(self.index_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                d = json.loads(line)
+                                t = d.get("title")
+                                if t:
+                                    titles.add(t)
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.warning(f"读取历史已同步索引台账失败: {e}")
+        return titles
+
 
 class FailedBooksRecorder:
     """失败书籍台账记录器 (线程安全，支持去重记录与读取)"""
@@ -850,14 +870,12 @@ def execute_sync(
     bucket_mgr = QuarkBucketManager(parent_dir=parent_dir, bucket_size=bucket_size, initial_state=chk_mgr.data.get("bucket_state"))
     idx_recorder = IndexRecorder(INDEX_FILE)
     failed_recorder = FailedBooksRecorder(FAILED_FILE)
-
-    last_path = chk_mgr.data.get("last_success_path", "")
-    passed_checkpoint = not bool(last_path)
+    synced_titles = idx_recorder.load_synced_titles()
 
     logger.info("==================================================")
     logger.info(f"启动多线程全速云端搬运: 网盘 [{nick}] (并发: {concurrency} 线程)")
     logger.info(f"目标 Alist 服务: {alist_url} (目录: {alist_path})")
-    logger.info(f"历史断点: {last_path or '从头开始'}")
+    logger.info(f"历史网盘已收录台账: 共 {len(synced_titles)} 本 (启动索引级毫秒去重，不重复、不漏书)")
     logger.info(f"实时索引输出: {INDEX_FILE}")
     logger.info(f"本次批次目标: {max_books} 本 | 安全运行上限: {max_seconds // 60} 分钟")
     logger.info("==================================================")
@@ -914,6 +932,7 @@ def execute_sync(
 
                 # 5. 实时记录轻量级索引 (供本地机器人 0.5 秒极速导入)
                 idx_recorder.record(title, fid, fmt)
+                synced_titles.add(title)
 
                 # 6. 更新成功统计与断点
                 with stat_lock:
@@ -970,19 +989,14 @@ def execute_sync(
         t.start()
         workers.append(t)
 
-    # 生产者：遍历 Alist 投递任务
-    completed_dirs = chk_mgr.data.get("completed_dirs", [])
-    if completed_dirs:
-        logger.info(f"检测到历史已全量完成目录 {len(completed_dirs)} 个，本次接力将 0 秒极速跳过无需扫描！")
-
+    # 生产者：基于网盘历史索引台账进行全量毫秒级精准增量去重
     logger.info("开始扫描 Alist 文件列表并投递搬运队列...")
     is_all_files_exhausted = False
-    skip_count = 0
-    passed_dirs_before_cp = set()
-    last_item_dir = ""
+    skipped_synced_count = 0
+    scanned_total_count = 0
 
     try:
-        for item in master_alist.list_files(alist_path, completed_dirs=completed_dirs):
+        for item in master_alist.list_files(alist_path):
             if stop_event.is_set():
                 break
             if time.time() - start_time >= max_seconds:
@@ -993,30 +1007,16 @@ def execute_sync(
             f_name = item["name"]
             f_path = item["full_path"]
             title = clean_book_title(f_name)
-            cur_dir = os.path.dirname(f_path)
+            scanned_total_count += 1
 
-            if not passed_checkpoint:
-                skip_count += 1
-                if last_item_dir and last_item_dir != cur_dir:
-                    passed_dirs_before_cp.add(last_item_dir)
-                last_item_dir = cur_dir
-
-                if skip_count % 1000 == 0:
-                    logger.info(f"正在全速快进比对历史断点... (已快速跳过 {skip_count} 本 | 当前目录: {cur_dir})")
-                if f_path == last_path:
-                    passed_checkpoint = True
-                    logger.info(f"精准匹配到历史断点: 《{title}》 (共快速跳过 {skip_count} 本历史已同步书籍)，开始全速并发搬运新书...")
-                    if passed_dirs_before_cp:
-                        chk_mgr.mark_dirs_completed(list(passed_dirs_before_cp))
-                        logger.info(f"已将断点前的 {len(passed_dirs_before_cp)} 个历史目录标记为已完成，下一轮将 0 秒直达！")
+            # 核心业务去重：若该书已在网盘历史索引台账中，0 微秒跳过，绝不重复上传
+            if title in synced_titles:
+                skipped_synced_count += 1
+                if skipped_synced_count % 3000 == 0:
+                    logger.info(f"智能跳过网盘已收录小说... (已去重跳过 {skipped_synced_count} 本已存在书籍 | 当前目录: {os.path.dirname(f_path)})")
                 continue
 
-            # 断点后跨目录时，自动将已搬运完毕的前一个目录标记为已完成
-            if last_item_dir and last_item_dir != cur_dir:
-                chk_mgr.mark_dirs_completed([last_item_dir])
-            last_item_dir = cur_dir
-
-            # 阻塞放入任务队列
+            # 发现网盘未收录的新小说，阻塞放入并发搬运队列
             while not stop_event.is_set():
                 try:
                     task_queue.put((f_name, f_path, title), timeout=1.0)
@@ -1081,7 +1081,9 @@ def execute_sync(
             chk_mgr.save()
 
     b_state = bucket_mgr.export_state()
-    total_synced_now = chk_mgr.data.get("total_synced_books", 0)
+    total_synced_now = len(synced_titles)
+    chk_mgr.data["total_synced_books"] = total_synced_now
+    chk_mgr.save()
     logger.info(f"==================================================")
     logger.info(f"批次完成！本批成功搬运: {success_cnt} 本，失败: {fail_cnt} 本，累计总数: {total_synced_now} 本")
     logger.info(f"实时索引已安全写入: {INDEX_FILE}")
@@ -1382,5 +1384,3 @@ def main():
         )
 
 
-if __name__ == "__main__":
-    main()
