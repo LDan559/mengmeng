@@ -979,26 +979,47 @@ def execute_sync(
     except Exception as e:
         logger.error(f"扫描 Alist 列表异常: {e}")
     finally:
-        # 发送终止哨兵
+        # 无论何种原因退出扫描，确保通知所有 Worker 停工
+        stop_event.set()
+        # 清空队列中积压的未消费任务，防止队列满载导致任何阻塞死锁
+        try:
+            while not task_queue.empty():
+                try:
+                    task_queue.get_nowait()
+                    task_queue.task_done()
+                except Exception:
+                    break
+        except Exception:
+            pass
+
+        # 尝试投递非阻塞退出哨兵
         for _ in range(concurrency):
-            task_queue.put(None)
+            try:
+                task_queue.put_nowait(None)
+            except Exception:
+                pass
 
-    # 等待所有线程退出
+    # 等待所有工作线程平稳退出 (带超时保护，绝不无限期挂死)
+    logger.info("等待所有并发工作线程平稳收工...")
     for t in workers:
-        t.join(timeout=30)
+        t.join(timeout=10)
+    logger.info("所有工作线程已全部安全退出。")
 
-    # 全自动补漏环节：批次末尾自动打捞偶发网络抖动失败的书籍，无需任何人工干预
-    recovered_cnt = auto_retry_failed_books(
-        quark_cookie=quark_cookie,
-        alist_url=alist_url,
-        alist_pwd=alist_pwd,
-        bucket_mgr=bucket_mgr,
-        idx_recorder=idx_recorder,
-        failed_recorder=failed_recorder,
-        chk_mgr=chk_mgr,
-        delay=delay
-    )
-    success_cnt += recovered_cnt
+    # 全自动补漏环节：若运行时间未耗尽则尝试打捞，若时间已到则留存至下批次
+    if time.time() - start_time < max_seconds:
+        recovered_cnt = auto_retry_failed_books(
+            quark_cookie=quark_cookie,
+            alist_url=alist_url,
+            alist_pwd=alist_pwd,
+            bucket_mgr=bucket_mgr,
+            idx_recorder=idx_recorder,
+            failed_recorder=failed_recorder,
+            chk_mgr=chk_mgr,
+            delay=delay
+        )
+        success_cnt += recovered_cnt
+    else:
+        logger.info("本批次运行时间已达到设定上限，剩余失败书籍将安全留存台账，留待下一轮接力时继续打捞。")
 
     # 保存最终剩余断点
     with stat_lock:
