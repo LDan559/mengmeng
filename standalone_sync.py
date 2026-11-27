@@ -50,7 +50,7 @@ DEFAULT_QUARK_COOKIE = ""
 def clean_book_title(raw_name: str) -> str:
     """去除常见电子书扩展名，提取纯书名"""
     t = raw_name.strip()
-    for ext in [".txt", ".epub", ".mobi", ".azw3", ".pdf", ".azw", ".zip"]:
+    for ext in [".txt", ".epub", ".mobi", ".azw3", ".pdf", ".azw", ".zip", ".rar", ".7z"]:
         if t.lower().endswith(ext):
             t = t[:-len(ext)].strip()
             break
@@ -531,7 +531,7 @@ class AlistClient:
                     else:
                         sub = f"{curr_dir}/{name}" if curr_dir != "/" else f"/{name}"
                         low = name.lower()
-                        if any(low.endswith(ext) for ext in [".txt", ".epub", ".zip", ".mobi", ".azw3"]):
+                        if any(low.endswith(ext) for ext in [".txt", ".epub", ".zip", ".mobi", ".azw3", ".pdf", ".azw", ".rar", ".7z"]):
                             yield {"name": name, "full_path": sub, "size": item.get("size", 0)}
 
                 if page * per_page >= total or len(items) < per_page:
@@ -666,19 +666,23 @@ class IndexRecorder:
         self._lock = threading.Lock()
         os.makedirs(os.path.dirname(os.path.abspath(self.index_path)), exist_ok=True)
 
-    def record(self, title: str, fid: str, format_type: str = "txt"):
-        line = json.dumps({
+    def record(self, title: str, fid: str, format_type: str = "txt", path: str = ""):
+        payload = {
             "title": title,
             "fid": fid,
             "format": format_type,
             "t": int(time.time())
-        }, ensure_ascii=False) + "\n"
+        }
+        if path:
+            payload["path"] = path
+        line = json.dumps(payload, ensure_ascii=False) + "\n"
         with self._lock:
             with open(self.index_path, "a", encoding="utf-8") as f:
                 f.write(line)
 
-    def load_synced_titles(self) -> set:
-        """从历史索引台账加载已成功同步的书籍集合 (用于毫秒级全量内存去重)"""
+    def load_synced_records(self) -> tuple[set, set]:
+        """从历史索引台账加载已成功同步的文件路径集合与书名集合"""
+        paths = set()
         titles = set()
         if os.path.exists(self.index_path):
             try:
@@ -688,13 +692,21 @@ class IndexRecorder:
                         if line:
                             try:
                                 d = json.loads(line)
+                                p = d.get("path")
                                 t = d.get("title")
+                                if p:
+                                    paths.add(p)
                                 if t:
                                     titles.add(t)
                             except Exception:
                                 pass
             except Exception as e:
                 logger.warning(f"读取历史已同步索引台账失败: {e}")
+        return paths, titles
+
+    def load_synced_titles(self) -> set:
+        """从历史索引台账加载已成功同步的书籍集合"""
+        _, titles = self.load_synced_records()
         return titles
 
 
@@ -870,12 +882,13 @@ def execute_sync(
     bucket_mgr = QuarkBucketManager(parent_dir=parent_dir, bucket_size=bucket_size, initial_state=chk_mgr.data.get("bucket_state"))
     idx_recorder = IndexRecorder(INDEX_FILE)
     failed_recorder = FailedBooksRecorder(FAILED_FILE)
-    synced_titles = idx_recorder.load_synced_titles()
+    synced_paths, synced_titles = idx_recorder.load_synced_records()
 
     logger.info("==================================================")
     logger.info(f"启动多线程全速云端搬运: 网盘 [{nick}] (并发: {concurrency} 线程)")
     logger.info(f"目标 Alist 服务: {alist_url} (目录: {alist_path})")
-    logger.info(f"历史网盘已收录台账: 共 {len(synced_titles)} 本 (启动索引级毫秒去重，不重复、不漏书)")
+    logger.info(f"【直通全量模式】零敏感词拦截、零书名去重，蓝奏云全量文件 100% 完整搬运！")
+    logger.info(f"历史断点已同步台账: 共 {len(synced_paths) or len(synced_titles)} 条")
     logger.info(f"实时索引输出: {INDEX_FILE}")
     logger.info(f"本次批次目标: {max_books} 本 | 安全运行上限: {max_seconds // 60} 分钟")
     logger.info("==================================================")
@@ -931,8 +944,9 @@ def execute_sync(
                 low_name = f_name.lower()
                 fmt = "zip" if low_name.endswith(".zip") else ("epub" if low_name.endswith(".epub") else "txt")
 
-                # 5. 实时记录轻量级索引 (供本地机器人 0.5 秒极速导入)
-                idx_recorder.record(title, fid, fmt)
+                # 5. 实时记录轻量级索引 (包含物理全路径，供精确断点识别与机器人秒发导入)
+                idx_recorder.record(title=title, fid=fid, format_type=fmt, path=f_path)
+                synced_paths.add(f_path)
                 synced_titles.add(title)
 
                 # 6. 更新成功统计与断点
@@ -1010,11 +1024,19 @@ def execute_sync(
             title = clean_book_title(f_name)
             scanned_total_count += 1
 
-            # 核心业务去重：若该书已在网盘历史索引台账中，0 微秒跳过，绝不重复上传
-            if title in synced_titles:
+            # 【直通搬运模式】取消基于纯书名的全局去重，零敏感词拦截
+            # 仅依据物理路径跳过已搬运文件，防止重复上传；不同目录、不同版本的同名文件 100% 全量搬运！
+            is_already_synced = False
+            if f_path in synced_paths:
+                is_already_synced = True
+            elif not synced_paths and title in synced_titles:
+                # 兼容旧版本仅有书名的历史台账，平滑过渡历史已处理数据
+                is_already_synced = True
+
+            if is_already_synced:
                 skipped_synced_count += 1
                 if skipped_synced_count % 3000 == 0:
-                    logger.info(f"智能跳过网盘已收录小说... (已去重跳过 {skipped_synced_count} 本已存在书籍 | 当前目录: {os.path.dirname(f_path)})")
+                    logger.info(f"断点跳过已搬运文件... (已跳过 {skipped_synced_count} 本已搬运书籍 | 当前目录: {os.path.dirname(f_path)})")
                 continue
 
             # 发现网盘未收录的新小说，阻塞放入并发搬运队列
@@ -1269,7 +1291,7 @@ def execute_retry_failed(
 
                 low_name = f_name.lower()
                 fmt = "zip" if low_name.endswith(".zip") else ("epub" if low_name.endswith(".epub") else "txt")
-                idx_recorder.record(title, fid, fmt)
+                idx_recorder.record(title=title, fid=fid, format_type=fmt, path=f_path)
 
                 with stat_lock:
                     bucket_mgr.current_count += 1
