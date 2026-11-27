@@ -147,6 +147,12 @@ jobs:
           echo "本批次顺利收工并已保存断点，检测到蓝奏云仍有未搬运书籍！"
           echo "正在自动拉起下一轮任务继续全速搬运..."
           echo "=========================================================="
-          if gh workflow run sync.yml \
-            --repo "${GITHUB_REPOSITORY}" \
-            -f max_books="${IN_MAX_BOOKS}" \
+          if gh workflow run sync.yml --repo "${GITHUB_REPOSITORY}" -f max_books="${IN_MAX_BOOKS}" -f concurrency="${IN_CONCURRENCY}" -f delay="${IN_DELAY}" -f max_seconds="${IN_MAX_SECONDS}"; then
+            echo "下一轮接力任务已成功拉起！"
+          else
+            echo "=========================================================="
+            echo "接力提示: 若因 GitHub 防死循环机制导致默认 GITHUB_TOKEN 无法触发新工作流，"
+            echo "请在仓库 Settings -> Secrets 中添加 SYNC_PAT 个人访问令牌 (勾选 workflow 权限)，"
+            echo "配置后后续批次即可全自动永动机持续接力拉起。"
+            echo "=========================================================="
+          fi
